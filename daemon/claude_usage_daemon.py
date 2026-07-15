@@ -32,6 +32,11 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 POLL_INTERVAL = 60
 TICK = 5
 CONNECT_TIMEOUT = 20.0
+# retrieveConnected is a local CoreBluetooth lookup, not a radio scan, so
+# re-checking it is nearly free — cap its wait low. A failed *connect* is a real
+# BLE round trip against a possibly-wedged peripheral, so that path backs off far.
+DISCOVER_BACKOFF_CAP = 5
+RECONNECT_BACKOFF_CAP = 60
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
 # Linux: token lives in ~/.claude/.credentials.json.
@@ -90,7 +95,31 @@ def _extract_access_token(blob: str) -> str | None:
     return None
 
 
-def _read_token_keychain() -> str | None:
+def _extract_expires_at(blob: str) -> float | None:
+    """Pull the token's expiry out of a credentials blob, as epoch seconds.
+
+    Mirrors _extract_access_token's shape handling (direct or nested under
+    claudeAiOauth). expiresAt is written JS-style in epoch milliseconds; a value
+    that large is divided down. Anything already plausible as seconds is taken
+    as-is — treating seconds as milliseconds would date the token to 1970 and
+    wedge the daemon into permanently believing it expired.
+    """
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    nested = [v for v in data.values() if isinstance(v, dict)]
+    for candidate in (data, *nested):
+        raw = candidate.get("expiresAt")
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
+            continue
+        return raw / 1000 if raw > 1e11 else float(raw)
+    return None
+
+
+def _read_keychain_blob() -> str | None:
     try:
         out = subprocess.run(
             [
@@ -113,7 +142,12 @@ def _read_token_keychain() -> str | None:
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         log(f"Keychain access error: {e}")
         return None
-    return _extract_access_token(out.stdout)
+    return out.stdout
+
+
+def _read_token_keychain() -> str | None:
+    blob = _read_keychain_blob()
+    return _extract_access_token(blob) if blob else None
 
 
 def read_config_dirs() -> list[Path]:
@@ -159,6 +193,52 @@ def read_token_for(config_dir: Path) -> str | None:
     if sys.platform == "darwin" and config_dir == DEFAULT_CONFIG_DIR:
         return _read_token_keychain()
     return None
+
+
+def read_expiry_for(config_dir: Path) -> float | None:
+    """Read the OAuth token's expiry for one config dir, as epoch seconds.
+
+    Resolves file-then-Keychain exactly like read_token_for. None means "no
+    expiry on record" — callers must treat that as unknown, not as expired.
+    """
+    cred = config_dir / ".credentials.json"
+    try:
+        if cred.exists():
+            return _extract_expires_at(cred.read_text())
+    except OSError:
+        return None
+    if sys.platform == "darwin" and config_dir == DEFAULT_CONFIG_DIR:
+        blob = _read_keychain_blob()
+        return _extract_expires_at(blob) if blob else None
+    return None
+
+
+# Config dirs currently known to hold an expired token, so the wait is logged
+# once per expiry rather than once per poll.
+_expired_dirs: set[Path] = set()
+
+
+def token_expired(config_dir: Path) -> bool:
+    """True when the stored token is already past its expiry.
+
+    The daemon never refreshes tokens — Claude Code owns that credential and
+    rewrites the Keychain when it renews. Polling with a token we can see is
+    dead just spends a guaranteed 401 every cycle, so skip the call and wait for
+    the refresh. An unknown expiry is not treated as expired: let the API judge.
+    """
+    expires_at = read_expiry_for(config_dir)
+    if expires_at is None:
+        return False
+    if time.time() < expires_at:
+        if config_dir in _expired_dirs:
+            _expired_dirs.discard(config_dir)
+            log(f"Token in {config_dir} was refreshed; resuming polls")
+        return False
+    if config_dir not in _expired_dirs:
+        _expired_dirs.add(config_dir)
+        when = time.strftime("%H:%M:%S", time.localtime(expires_at))
+        log(f"Token in {config_dir} expired at {when}; waiting for Claude Code to refresh it")
+    return True
 
 
 def load_cached_address() -> str | None:
@@ -373,6 +453,36 @@ def add_clock_fields(payload: dict) -> None:
     payload["tf"] = tf
 
 
+# Earliest time the next poll may run, set from a 429's Retry-After. 0 = no hold.
+_retry_after_until = 0.0
+
+# Rate-limit headers this function reads. A response carrying either one is
+# usable regardless of its status code — the reading lives in the headers.
+_UTIL_HEADERS = (
+    "anthropic-ratelimit-unified-5h-utilization",
+    "anthropic-ratelimit-unified-overage-utilization",
+)
+
+
+def _note_retry_after(resp) -> None:
+    """Record a Retry-After hint as a floor on the next poll."""
+    global _retry_after_until
+    raw = resp.headers.get("retry-after")
+    if not raw:
+        return
+    try:
+        secs = float(raw)
+    except ValueError:
+        return  # HTTP-date form; the POLL_INTERVAL cadence is gentle enough
+    if secs <= 0:
+        return
+    # Cap the hold: the device shows a live countdown built from these polls, so
+    # a long server hint must not freeze the screen for an hour.
+    secs = min(secs, 300.0)
+    _retry_after_until = time.time() + secs
+    log(f"Rate limited; holding polls for {int(secs)}s (Retry-After)")
+
+
 async def poll_api(token: str) -> dict | None:
     headers = dict(API_HEADERS_TEMPLATE)
     headers["Authorization"] = f"Bearer {token}"
@@ -382,7 +492,19 @@ async def poll_api(token: str) -> dict | None:
     except httpx.HTTPError as e:
         log(f"API call failed: {e}")
         return None
-    if resp.status_code >= 400:
+
+    # A 429 is not a failed reading — it is the truest one we ever get. This
+    # function only ever reads rate-limit *headers* (the body is never parsed),
+    # and a 429 still carries them, so bailing here threw away the exact moment
+    # the cap was hit and left the screen frozen on the last pre-limit value.
+    # Auth errors carry no such headers, so those still bail.
+    rate_limited = resp.status_code == 429
+    if rate_limited:
+        _note_retry_after(resp)
+        if not any(resp.headers.get(h) for h in _UTIL_HEADERS):
+            log(f"API HTTP 429 without rate-limit headers: {resp.text[:200]}")
+            return None
+    elif resp.status_code >= 400:
         log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
         return None
 
@@ -429,6 +551,15 @@ async def poll_api(token: str) -> dict | None:
             **_billing_period_info(now, reset_ts),
             "ok": True,
         }
+    if rate_limited:
+        # The window is refusing work, so it is full — say so plainly. The
+        # utilization header can still read just under 100 at this point (it
+        # read 97 the last time this fired), and the device draws the number it
+        # is given, so without this the screen sits at 97% while every request
+        # bounces. Logged raw so a future incident shows what the API really
+        # reported and whether this clamp is still earning its keep.
+        log(f"Rate limited; header util={payload['s']} status={payload['st']!r} -> reporting 100")
+        payload["s"] = 100
     add_chime_field(payload)   # adds "c":1 iff the config opts in
     add_clock_fields(payload)   # adds "t" + "tf" iff the config opts in
     return payload
@@ -517,6 +648,8 @@ async def poll_active_payload(selector: PlanSelector = _SELECTOR) -> dict | None
         token = read_token_for(d)
         if not token:
             log(f"No token in {d}; skipping")
+            continue
+        if token_expired(d):
             continue
         payload = await poll_api(token)
         if payload is not None:
@@ -696,13 +829,22 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
         while client.is_connected and not stop_event.is_set():
             now = time.time()
             elapsed = now - last_poll
-            if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
+            due = session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL
+            if due and now < _retry_after_until:
+                due = False  # server asked us to wait; the last payload still stands
+            if due:
                 session.refresh_requested.clear()
+                # Advance the clock on the attempt, not on the outcome. Keying
+                # this off success alone left `elapsed` permanently past the
+                # interval whenever the API said no, turning every failure into
+                # a TICK-rate retry storm: 176 calls in 16 minutes during one
+                # rate limit, each one another request against the very quota
+                # that was already exhausted.
+                last_poll = time.time()
                 payload = await poll_active_payload()
                 if payload is None:
                     log("No usable config dir this cycle")
                 elif await session.write_payload(payload):
-                    last_poll = time.time()
                     used_successfully = True
 
             try:
@@ -736,7 +878,8 @@ async def main() -> None:
     log("=== Claude Usage Tracker Daemon (BLE, macOS) ===")
     log(f"Poll interval: {POLL_INTERVAL}s")
 
-    backoff = 1
+    discover_backoff = 1
+    reconnect_backoff = 1
     skip_addr: str | None = None  # macOS: a peripheral to skip for one cycle
     while not stop_event.is_set():
         # Apply any pending skip exactly once, then clear it so the next
@@ -744,13 +887,14 @@ async def main() -> None:
         target = await discover_target(skip_addr=skip_addr)
         skip_addr = None
         if not target:
-            log(f"Device not found, retrying in {backoff}s...")
+            log(f"Device not found, retrying in {discover_backoff}s...")
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+                await asyncio.wait_for(stop_event.wait(), timeout=discover_backoff)
             except asyncio.TimeoutError:
                 pass
-            backoff = min(backoff * 2, 60)
+            discover_backoff = min(discover_backoff * 2, DISCOVER_BACKOFF_CAP)
             continue
+        discover_backoff = 1
 
         addr = target if isinstance(target, str) else target.address
         ok = await connect_and_run(target, stop_event)
@@ -763,12 +907,12 @@ async def main() -> None:
                 log("Invalidating cached address")
                 SAVED_ADDR_FILE.unlink(missing_ok=True)
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=backoff)
+                await asyncio.wait_for(stop_event.wait(), timeout=reconnect_backoff)
             except asyncio.TimeoutError:
                 pass
-            backoff = min(backoff * 2, 60)
+            reconnect_backoff = min(reconnect_backoff * 2, RECONNECT_BACKOFF_CAP)
         else:
-            backoff = 1
+            reconnect_backoff = 1
 
 
 if __name__ == "__main__":
