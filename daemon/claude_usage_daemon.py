@@ -59,6 +59,12 @@ API_BODY = {
 }
 
 
+class TokenExpired(Exception):
+    """Raised by poll_api on a 401/403 — the access token is dead. The daemon never
+    refreshes (pure free-ride: Claude Code owns refreshing), so the caller just
+    signals "No data" to the device until the CLI re-seeds the token."""
+
+
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -119,6 +125,23 @@ def _extract_expires_at(blob: str) -> float | None:
     return None
 
 
+def _decode_keychain_blob(raw: str) -> str:
+    """Transparently decode a hex-dumped Keychain secret back to text.
+
+    ``security … -w`` prints the password as a continuous hex string whenever
+    the stored bytes aren't cleanly printable (e.g. an embedded newline). A
+    normal credentials blob is JSON, which is never valid hex (it contains
+    '{', '"', …), so all-hex detection is unambiguous and safe.
+    """
+    s = raw.strip()
+    if s and len(s) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", s):
+        try:
+            return bytes.fromhex(s).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return raw
+    return raw
+
+
 def _read_keychain_blob() -> str | None:
     try:
         out = subprocess.run(
@@ -142,7 +165,7 @@ def _read_keychain_blob() -> str | None:
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         log(f"Keychain access error: {e}")
         return None
-    return out.stdout
+    return _decode_keychain_blob(out.stdout)
 
 
 def _read_token_keychain() -> str | None:
@@ -492,12 +515,15 @@ async def poll_api(token: str) -> dict | None:
     except httpx.HTTPError as e:
         log(f"API call failed: {e}")
         return None
+    if resp.status_code in (401, 403):
+        log(f"API HTTP {resp.status_code} (token expired/invalid)")
+        raise TokenExpired()
 
     # A 429 is not a failed reading — it is the truest one we ever get. This
     # function only ever reads rate-limit *headers* (the body is never parsed),
     # and a 429 still carries them, so bailing here threw away the exact moment
     # the cap was hit and left the screen frozen on the last pre-limit value.
-    # Auth errors carry no such headers, so those still bail.
+    # Auth errors carry no such headers, so those still bail (above).
     rate_limited = resp.status_code == 429
     if rate_limited:
         _note_retry_after(resp)
@@ -635,32 +661,61 @@ class PlanSelector:
 _SELECTOR = PlanSelector()
 
 
-async def poll_active_payload(selector: PlanSelector = _SELECTOR) -> dict | None:
-    """Poll every configured config dir and return the active plan's payload.
+async def poll_active(selector: PlanSelector = _SELECTOR) -> tuple[dict | None, bool]:
+    """Poll every configured config dir; return ``(active_payload, all_dead)``.
 
-    Returns None when no dir yields a usable payload this cycle. A single
-    configured dir (the default) collapses to exactly the old single-poll path.
+    ``active_payload`` — the active plan's payload dict, or None when no dir
+    yields a usable payload this cycle. A single configured dir (the default)
+    collapses to exactly the old single-poll path.
+
+    ``all_dead`` — True when *every* configured dir lacked a usable token this
+    cycle (file/Keychain empty, or a 401/expired token), so the caller can
+    signal "No data". False when at least one token authenticated — including a
+    transient non-auth poll failure worth retrying silently rather than idling.
+
+    Pure free-ride: a 401 (TokenExpired) means that dir's token has expired and
+    only Claude Code (its owner) can re-seed it — we never refresh it ourselves.
     """
     dirs = read_config_dirs()
     payloads: dict[Path, dict] = {}
     sessions: dict[Path, int] = {}
+    any_live = False
     for d in dirs:
         token = read_token_for(d)
         if not token:
             log(f"No token in {d}; skipping")
             continue
         if token_expired(d):
+            # Known-expired locally: skip without burning an API call. Not
+            # "live" either, so the no-data beat still fires.
             continue
-        payload = await poll_api(token)
+        try:
+            payload = await poll_api(token)
+        except TokenExpired:
+            log(f"Token in {d} expired/invalid; skipping")
+            continue
+        # Authenticated: a transient None here isn't an auth failure, so the
+        # dir counts as live and we stay silent rather than idling the device.
+        any_live = True
         if payload is not None:
             payloads[d] = payload
             sessions[d] = int(payload.get("s", 0) or 0)
     if not payloads:
-        return None
+        return None, not any_live
     active = selector.choose(sessions)
     if len(dirs) > 1:
         log(f"Active plan: {active} (s={sessions[active]})")
-    return payloads[active]
+    return payloads[active], False
+
+
+async def poll_active_payload(selector: PlanSelector = _SELECTOR) -> dict | None:
+    """The active plan's payload, or None when no dir yields one this cycle.
+
+    Thin wrapper over :func:`poll_active` for callers that don't need the
+    all-dead flag.
+    """
+    payload, _dead = await poll_active(selector)
+    return payload
 
 
 class Session:
@@ -834,6 +889,14 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
                 due = False  # server asked us to wait; the last payload still stands
             if due:
                 session.refresh_requested.clear()
+                # Pure free-ride: read whatever access token(s) Claude Code
+                # currently holds across the configured config dirs and NEVER
+                # refresh them ourselves. Claude Code (the token's owner) does all
+                # refreshing; refreshing here would race its rotation and feed the
+                # OAuth endpoint's rate limit (429). When no dir has a usable token
+                # we signal "No data" so the device idles instead of holding stale
+                # numbers until the CLI re-seeds it.
+                #
                 # Advance the clock on the attempt, not on the outcome. Keying
                 # this off success alone left `elapsed` permanently past the
                 # interval whenever the API said no, turning every failure into
@@ -841,11 +904,20 @@ async def connect_and_run(target, stop_event: asyncio.Event) -> bool:
                 # rate limit, each one another request against the very quota
                 # that was already exhausted.
                 last_poll = time.time()
-                payload = await poll_active_payload()
-                if payload is None:
+                payload, dead = await poll_active()
+                if payload is not None:
+                    if await session.write_payload(payload):
+                        used_successfully = True
+                elif dead:
+                    # No live token in any config dir (missing, or a 401/expired
+                    # token) -> show "No data" now instead of stale numbers.
+                    log("No usable token; signalling no-data to device — run "
+                        "`claude login` or use the CLI to let Claude Code renew it")
+                    await session.write_payload({"ok": False})
+                else:
+                    # Transient poll failure (a live token that didn't answer this
+                    # cycle) -> stay silent and retry next cycle.
                     log("No usable config dir this cycle")
-                elif await session.write_payload(payload):
-                    used_successfully = True
 
             try:
                 await asyncio.wait_for(session.refresh_requested.wait(), timeout=TICK)

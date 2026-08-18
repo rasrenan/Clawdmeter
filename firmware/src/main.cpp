@@ -294,6 +294,7 @@ void loop() {
     imu_hal_tick();
     sound_hal_tick();
     splash_tick();
+    splash_mascot_tick();
     // Rotation transition (blank + ramp) would fight the idle fade — skip
     // ticks while the panel is dark. A rotation that happens during sleep
     // is detected by the next tick after wake and ramped in then.
@@ -362,6 +363,7 @@ void loop() {
     int  pct      = power_hal_battery_pct();
     bool charging = power_hal_is_charging();
     if (pct != last_pct || charging != last_charging) {
+        if (pct != last_pct) ble_set_battery_level(pct);
         last_pct = pct;
         last_charging = charging;
         ui_update_battery(pct, charging);
